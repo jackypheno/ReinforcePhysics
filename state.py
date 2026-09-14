@@ -1,4 +1,4 @@
-# smeft_rl/state.py
+# smeft_new/state.py
 
 from dataclasses import dataclass, field
 from typing import List, Dict, Callable, Tuple
