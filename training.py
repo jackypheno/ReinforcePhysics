@@ -24,7 +24,7 @@ sys.path.insert(
 
 )
 
-from smeft_new.pulls_linear_10 import (
+from smeft_new.enviornment import (
 
     constraints_ewp,
 
