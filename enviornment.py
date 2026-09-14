@@ -2,7 +2,7 @@ import json
 import math
 import numpy as np
 import flavio
-import smeft_new.flavio_overrides  # one line, applies all anomalies immediately
+import smeft_new.anomalies  # one line, applies all anomalies immediately
 from wilson import Wilson
 from iminuit import Minuit
 #from flavio.statistics.likelihood import FastLikelihood
