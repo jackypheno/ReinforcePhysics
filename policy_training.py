@@ -1,121 +1,61 @@
 import sys
-
 from pathlib import Path
-
 import copy
-
 import random
-
 import numpy as np
-
 import torch
-
 import torch.nn as nn
-
 import torch.nn.functional as F
-
 import contextlib
+import argparse
+import warnings
+import flavio
+import wilson
+from wilson import wcxf
 
-sys.path.insert(
-
-    0,
-
-    "/home/kumarj/links/projects/def-london/kumarj/gitrepos/smeft-anomaly"
-
-)
+sys.path.insert(0, "/smeft-anomaly")
 
 from smeft_new.enviornment import (
-
     constraints_ewp,
-
     CHI2_SM,
-
     flavio_pull_fn,
-
-    BASELINE_PULLS ,
-
-)
+    BASELINE_PULLS ,)
 
 
 OBS_NAMES = constraints_ewp
-
 from smeft_new.state import SMEFTState, step
-
 from smeft_new.helpers import print_policy_diagnostics
-
 #from smeft_new.sensitivity_matrix import M_ij
 
+# M_ij injects prior physics knowledge directly to 
+# logits and attention, if required this can added,
+# right now we set this to zero.
 
-# ------------------------------------------------------------
-
-# LOAD OPERATOR VOCABULARY
-
-# ------------------------------------------------------------
-
-import argparse
-
-import warnings
-
-import flavio
-
-import wilson
-
-from wilson import wcxf
-
+# Filter wcxf Warsaw basis WCs, which conserve the B, L and lepton flavour
 warnings.filterwarnings("ignore")
 
 def _build_catalogue_from_wcxf() -> dict[str, list[str]]:
-
-    """
-
-    Query the wcxf package for every WC in the SMEFT Warsaw basis and
-
-    organise them by their wcxf 'sector' label.
-
-    Returns
-
-    -------
-
-    dict  {sector_name: [wc_name, ...]}  - ordered by sector, then WC name
-
-    """
-
     try:
-
         basis_obj = wcxf.Basis["SMEFT", "Warsaw"]
-
         catalogue: dict[str, list[str]] = {}
-
         for sector_name, sector_data in basis_obj.sectors.items():
-
             if sector_name == "dB=de=dmu=dtau=0":
-
                 wcs = sorted(sector_data.keys())
-
                 if wcs:
-
                     catalogue[sector_name] = wcs
-
         return catalogue
 
     except Exception as exc:
-
         warnings.warn(
-
             f"Could not load Warsaw basis from wcxf ({exc}). "
-
             "Falling back to a minimal built-in catalogue."
-
         )
-
         return _fallback_catalogue()
 
+
 OPERATOR_CATALOGUE: dict[str, list[str]] = _build_catalogue_from_wcxf()
-
 operator_vocab: list[str] = [wc for ops in OPERATOR_CATALOGUE.values() for wc in ops]
-
 print(f"Loaded {len(operator_vocab)} operators")
-
 print(operator_vocab[:100])
 
 # Adding a copy method to SMEFTState class
