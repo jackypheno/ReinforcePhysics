@@ -4,6 +4,8 @@ from flavio.statistics.probability import NormalDistribution
 #from smeft_new.pulls_linear_10 import ewp_coefficients, obs_correspondence  # adjust import path as needed
 import json
 
+""" The observables in flavio and json file containing linear expressions have sligthly different names, 
+    the correspondence between them goes as: """
 
 obs_correspondence = {
     'GammaZ': 'GammaZ',
@@ -52,8 +54,7 @@ obs_correspondence = {
 
 # Path to pre-computed SMEFT linear expansion coefficients
 COEFFICIENTS_PATH = (
-    "/home/kumarj/links/projects/def-london/kumarj/gitrepos/"
-    "smeft-anomaly/smeft_new/ewp_linear_coefficients_2.json"
+    "/smeft_new/ewp_linear_coefficients_2.json"
 )
 
 # ============================================================
@@ -62,9 +63,9 @@ COEFFICIENTS_PATH = (
 
 with open(COEFFICIENTS_PATH, "r", encoding="utf-8") as f:
     ewp_data = json.load(f)
-
 ewp_coefficients = ewp_data["observables"]
 
+# now we inject anomaly by overriding the measurements stored in flavio.
 
 def inject_anomaly(flavio_obs, n_sigma, exp_unc_frac=None):
     if flavio_obs not in obs_correspondence:
