@@ -1,575 +1,37 @@
-# Combined flat-direction RL training script
-
-# Generated from the two user-provided scripts.
-
-# Objective: find sparse operator subsets with the smallest SM-like chi2 at fixed ||C||.
-
-import json
-
-import numpy as np
-
-import flavio
-
-
-
-# ============================================================
-
-# 1. CONFIGURATION & EXPERIMENTAL CONSTRAINTS
-
-
-
-# ============================================================
-
-obs_correspondence = {
-
-    'GammaZ': 'GammaZ',
-
-    'sigma_had': 'sigma_had',
-
-    'R_e': 'R_e',
-
-    'R_mu': 'R_mu',
-
-    'R_tau': 'R_tau',
-
-    'AFB(Z->ee)': 'AFB(Z->ee)',
-
-    'AFB(Z->mumu)': 'AFB(Z->mumu)',
-
-    'AFB(Z->tautau)': 'AFB(Z->tautau)',
-
-    'A(Z->ee)': 'A(Z->ee)',
-
-    'A(Z->mumu)': 'A(Z->mumu)',
-
-    'A(Z->tautau)': 'A(Z->tautau)',
-
-    'GammaW': 'GammaW',
-
-    'BR(W->enu)': 'BR(W->enu)',
-
-    'BR(W->munu)': 'BR(W->munu)',
-
-    'BR(W->taunu)': 'BR(W->taunu)',
-
-    'R(W->cX)': 'R(W->cX)',
-
-    'Rmue(W->lnu)': 'Rmue(W->lnu)',
-
-    'Rtaue(W->lnu)': 'Rtaue(W->lnu)',
-
-    'Rtaumu(W->lnu)': 'Rtaumu(W->lnu)',
-
-    'A(Z->ss)': 'A(Z->ss)',
-
-    'm_W': 'm_W',          # Delta F=0
-
-    'AFB(Z->bb)': 'AFB(Z->bb)',
-
-    'BR(B+->Knunu)': 'BR(B+->Knunu)',  # CC
-
-    'Rtaul(B->Dlnu)': 'Rtaul(B->Dlnu)',
-
-    'epsp/eps': 'epsp/eps', # Delta F=1
-
-    # Binned observables
-
-    ("<P5p>(B0->K*mumu)", 4, 6): 'P5p46', # Delta F=1
-
-    ("<dBR/dq2>(Bs->phimumu)", 1, 6): 'Bsphimumu16',
-
-    'BR(K+->pinunu)': 'BR(K+->pinunu)', # Delta F=1
-
-    'BR(KL->pinunu)': 'BR(KL->pinunu)',
-
-    'DeltaM_s': 'DeltaM_s', # Delta F=1
-
-    'eps_K': 'eps_K', # constraint
-
-    'BR(Bs->mumu)': 'BR(Bs->mumu)', # constraint
-
-}
-
-constraints_ewp = keys = list(obs_correspondence.values())
-
-constraints_ewp_exp = list(obs_correspondence.keys())
-
-SIGMA_TARGET = 1.0
-
-EXPONENT_CLAMP = 50.0
-
-# Path to pre-computed SMEFT linear expansion coefficients
-
-COEFFICIENTS_PATH = (
-
-#    "/home/kumarj/links/scratch/tmp_real/ewp_linear_coefficients_quad_fixed.json"
-
-    "/home/kumarj/links/scratch/tmp_real/ewp_linear_coefficients_2.json"
-
-)
-
-
-
-# ============================================================
-
-# 3. LOAD LINEAR SMEFT COEFFICIENTS
-
-
-
-# ============================================================
-
-with open(COEFFICIENTS_PATH, "r", encoding="utf-8") as f:
-
-    ewp_data = json.load(f)
-
-ewp_coefficients = ewp_data["observables"]
-
-ewp_coefficients_meta = ewp_data["metadata"]
-
-
-
-# ============================================================
-
-# 4. KINEMATIC & PREDICTION HELPERS
-
-
-
-# ============================================================
-
-
-
-def predict_ewp(obs: str, wc_dict: dict, ewp_data: dict) -> float:
-
-    """
-
-    Computes linearized SMEFT prediction for a single observable, per the
-
-    linear-only JSON schema:
-
-        O/O_SM = 1 + sum_i coefficient_i * (NORMALIZE * C_i)
-
-    Parameters
-
-    ----------
-
-    obs : str
-
-        Observable name, must be a key in ewp_data["observables"].
-
-    wc_dict : dict
-
-        Wilson coefficients {operator_name: value}, in the *raw*
-
-        (un-normalized) convention -- normalization is applied here.
-
-    ewp_data : dict
-
-        The full parsed JSON (contains "metadata" and "observables").
-
-    """
-
-    observables = ewp_data.get("observables", {})
-
-    if obs not in observables:
-
-        raise KeyError(f"Observable '{obs}' not found in loaded JSON data.")
-
-    data = observables[obs]
-
-    metadata = ewp_data.get("metadata", {})
-
-    normalize = metadata.get("normalize", 1.0)
-
-    sm = data.get("sm_prediction", 0.0)
-
-    coeffs = data.get("coefficients", {})
-
-    # Scale each relevant Wilson coefficient by NORMALIZE once
-
-    scaled_wc = {
-
-        wc: val #* normalize
-
-        for wc, val in wc_dict.items()
-
-        if wc in coeffs
-
-    }
-
-    linear_term = sum(
-
-        coeffs[wc] * scaled_wc[wc]
-
-        for wc in scaled_wc
-
-    )
-
-    delta = linear_term
-
-    return sm * (1 + delta)
-
-
-
-def predict_observables(wc_dict: dict) -> dict:
-
-    """Computes predictions for all observables in constraints_ewp."""
-
-    return {obs: predict_ewp(obs, wc_dict, ewp_data) for obs in constraints_ewp}
-
-
-
-# ============================================================
-
-# EXPERIMENTAL CONSTRAINTS & CHI2 HELPERS
-
-
-
-# ============================================================
-
-obs_correspondence_reverse = {
-
-    value: key
-
-    for key, value in obs_correspondence.items()
-
-}
-
-
-
-# ============================================================
-
-# FLAT-DIRECTION OBJECTIVE
-
-
-
-# ============================================================
-
-# RL chooses a sparse operator subset S. For each selected subset, solve
-
-#
-
-#     minimize chi2_SM_like(C_S)
-
-#     subject to ||C_S|| = FIXED_WC_NORM.
-
-#
-
-# All subsets are therefore compared at exactly the same NP coefficient
-
-# radius. Because the observable model is linear in the Wilson coefficients,
-
-# chi2_SM_like is a quadratic form and the constrained minimum is obtained
-
-# exactly from the smallest eigenvector of the selected Fisher/Gram matrix.
-
-# RL is used only for the combinatorial operator-subset search.
-
-FIXED_WC_NORM = 1.0
-
-FLAT_REWARD_EPS = 1e-12
-
-SPARSITY_PENALTY = 0.05
-
-# Later operators are accepted only if they reduce fixed-norm SM-like chi2
-# by at least this many decades. 0.05 is about a 12% reduction.
-MIN_LOG10_CHI2_IMPROVEMENT = 0.05
-REJECTED_STEP_PENALTY = 0.20
-
-SM_PREDICTIONS = predict_observables({})
-
-FLAT_SIGMAS = {}
-
-FLAT_OBSERVABLES = []
-
-for _obs_name in constraints_ewp:
-
-    _theory_sigma = float(
-
-        ewp_coefficients[_obs_name].get("sm_uncertainty", 0.0)
-
-    )
-
-    if not np.isfinite(_theory_sigma) or _theory_sigma <= 0.0:
-
-        print(
-
-            f"[flat-direction] Excluding {_obs_name}: "
-
-            f"theory uncertainty = {_theory_sigma}"
-
-        )
-
-        continue
-
-    FLAT_SIGMAS[_obs_name] = _theory_sigma
-
-    FLAT_OBSERVABLES.append(_obs_name)
-
-
-
-if not FLAT_OBSERVABLES:
-
-    raise ValueError("No observables have positive theory uncertainty.")
-
-
-
-print(
-
-    f"[flat-direction] Using {len(FLAT_OBSERVABLES)}/"
-
-    f"{len(constraints_ewp)} observables with positive theory uncertainty"
-
-)
-
-
-
-
-
-# RL observable space is defined only after filtering invalid theory uncertainties.
-
-OBS_NAMES = list(FLAT_OBSERVABLES)
-
-N_OBS = len(OBS_NAMES)
-
-FLAT_BASELINE_PULLS = np.zeros(N_OBS, dtype=np.float32)
-
-
-
-def compute_sm_like_pulls(wc_dict: dict) -> list[float]:
-
-    """Return (O_NP - O_SM) / sigma_theory for every observable."""
-
-    predictions = predict_observables(wc_dict)
-
-    pulls = []
-
-    for obs_name in FLAT_OBSERVABLES:
-
-        delta = float(predictions[obs_name]) - float(SM_PREDICTIONS[obs_name])
-
-        pulls.append(float(delta / FLAT_SIGMAS[obs_name]))
-
-    return pulls
-
-
-
-def compute_sm_like_chi2(wc_dict: dict) -> float:
-
-    """chi2_SM-like = sum_i [(O_i(C)-O_i(SM))/sigma_theory_i]^2."""
-
-    pulls = np.asarray(compute_sm_like_pulls(wc_dict), dtype=np.float64)
-
-    return float(np.dot(pulls, pulls))
-
-
-
-def _build_pull_sensitivity(wc_names: list[str]) -> np.ndarray:
-
-    """
-
-    Build B with delta_pull = B @ C for the selected operators.
-
-    For the linear model
-
-        O = O_SM * (1 + sum_j a_j C_j),
-
-    so
-
-        B_ij = O_SM_i * a_ij / sigma_theory_i.
-
-    """
-
-    B = np.zeros((len(FLAT_OBSERVABLES), len(wc_names)), dtype=np.float64)
-
-    for i, obs_name in enumerate(FLAT_OBSERVABLES):
-
-        data = ewp_coefficients[obs_name]
-
-        sm = float(data.get("sm_prediction", SM_PREDICTIONS[obs_name]))
-
-        coeffs = data.get("coefficients", {})
-
-        sigma = FLAT_SIGMAS[obs_name]
-
-        for j, wc_name in enumerate(wc_names):
-
-            B[i, j] = sm * float(coeffs.get(wc_name, 0.0)) / sigma
-
-    return B
-
-
-
-def _minimise_sm_deviation_at_fixed_norm(
-
-    wc_names: list[str],
-
-    fixed_norm: float = FIXED_WC_NORM,
-
-) -> tuple[float, dict]:
-
-    """
-
-    Minimize chi2_SM-like subject to ||C|| = fixed_norm.
-
-    With linear predictions, chi2 = C^T (B^T B) C. At fixed norm,
-
-    the exact minimum is fixed_norm^2 times the smallest eigenvalue of B^T B.
-
-    """
-
-    n = len(wc_names)
-
-    if n == 0:
-
-        return 0.0, {}
-
-    if fixed_norm <= 0.0:
-
-        raise ValueError("fixed_norm must be positive")
-
-    B = _build_pull_sensitivity(wc_names)
-
-    fisher = B.T @ B
-
-    eigenvalues, eigenvectors = np.linalg.eigh(fisher)
-
-    idx = int(np.argmin(eigenvalues))
-
-    direction = np.asarray(eigenvectors[:, idx], dtype=np.float64)
-
-    direction_norm = float(np.linalg.norm(direction))
-
-    if not np.isfinite(direction_norm) or direction_norm <= 0.0:
-
-        raise RuntimeError(f"Invalid minimum-eigenvalue direction for {wc_names}")
-
-    coeffs = fixed_norm * direction / direction_norm
-
-    best_wc = {wc_names[i]: float(coeffs[i]) for i in range(n)}
-
-    min_chi2 = compute_sm_like_chi2(best_wc)
-
-    if not np.isfinite(min_chi2):
-
-        raise RuntimeError(f"Non-finite fixed-norm chi2 for {wc_names}")
-
-    return float(min_chi2), best_wc
-
-
-
-def flat_direction_fn(fired_ops: list) -> tuple:
-
-    """
-
-    Environment used by RL. For the selected operators, return the direction
-
-    with ||C|| = FIXED_WC_NORM that is least visible relative to the SM.
-
-    Returns
-
-    -------
-
-    OBS_NAMES, sm_like_pulls, min_sm_like_chi2, predictions, best_wc
-
-    """
-
-    if len(fired_ops) == 0:
-
-        best_wc = {}
-
-        min_chi2 = 0.0
-
-    else:
-
-        min_chi2, best_wc = _minimise_sm_deviation_at_fixed_norm(fired_ops)
-
-    prediction_dict = predict_observables(best_wc)
-
-    predictions = [float(prediction_dict[o]) for o in FLAT_OBSERVABLES]
-
-    pulls = compute_sm_like_pulls(best_wc)
-
-    sm_like_chi2 = float(np.dot(np.asarray(pulls), np.asarray(pulls)))
-
-    if not np.all(np.isfinite(pulls)):
-
-        raise ValueError(f"Non-finite flat-direction pulls: {pulls}")
-
-    if len(fired_ops) > 0 and not np.isclose(
-
-        sum(float(v) ** 2 for v in best_wc.values()),
-
-        FIXED_WC_NORM ** 2,
-
-        rtol=1e-7,
-
-        atol=1e-9,
-
-    ):
-
-        raise RuntimeError("Fixed-norm optimizer returned a WC vector with wrong norm")
-
-    return OBS_NAMES, pulls, sm_like_chi2, predictions, best_wc
-
-
-
-# ============================================================
-
-# RL TRAINING
-
-
-
-# ============================================================
-
 import sys
-
 from pathlib import Path
-
 import copy
-
 import random
-
 import numpy as np
-
 import torch
-
 import torch.nn as nn
-
 import torch.nn.functional as F
-
 import contextlib
-
 sys.path.insert(
-
     0,
-
     "/home/kumarj/links/projects/def-london/kumarj/gitrepos/smeft-anomaly")
 
+from smeft_new.pulls_linear_10 import (
+    constraints_ewp,
+    CHI2_SM,
+    flavio_pull_fn,
+    BASELINE_PULLS ,
+)
+
+OBS_NAMES = constraints_ewp
 from smeft_new.state import SMEFTState, step
-
 from smeft_new.helpers import print_policy_diagnostics
-
 #from smeft_new.sensitivity_matrix import M_ij
-
 # ------------------------------------------------------------
-
 # LOAD OPERATOR VOCABULARY
-
 # ------------------------------------------------------------
-
 import argparse
-
 import warnings
-
 import flavio
-
 import wilson
-
 from wilson import wcxf
 
 warnings.filterwarnings("ignore")
-
-
 
 def _build_catalogue_from_wcxf() -> dict[str, list[str]]:
 
@@ -618,265 +80,132 @@ def _build_catalogue_from_wcxf() -> dict[str, list[str]]:
         return _fallback_catalogue()
 
 OPERATOR_CATALOGUE: dict[str, list[str]] = _build_catalogue_from_wcxf()
-
-all_operator_vocab: list[str] = [
-
-    wc for ops in OPERATOR_CATALOGUE.values() for wc in ops
-
-]
-
-
-
-def _operator_has_observable_sensitivity(wc_name: str, tol: float = 0.0) -> bool:
-
-    """Exclude operators that are identically invisible to the chosen dataset."""
-
-    for obs_name in FLAT_OBSERVABLES:
-
-        coeff = float(
-
-            ewp_coefficients[obs_name].get("coefficients", {}).get(wc_name, 0.0)
-
-        )
-
-        if abs(coeff) > tol:
-
-            return True
-
-    return False
-
-operator_vocab: list[str] = [
-
-    wc for wc in all_operator_vocab if _operator_has_observable_sensitivity(wc)
-
-]
-
-print(
-
-    f"Loaded {len(operator_vocab)} observable-sensitive operators "
-
-    f"out of {len(all_operator_vocab)} Warsaw-basis operators"
-
-)
-
+operator_vocab: list[str] = [wc for ops in OPERATOR_CATALOGUE.values() for wc in ops]
+print(f"Loaded {len(operator_vocab)} operators")
 print(operator_vocab[:100])
+
+
 
 # Adding a copy method to SMEFTState class
 
 # This assumes SMEFTState is a dataclass or similar simple class
 
-
-
 def _smeftstate_copy(self):
 
-    new_state = SMEFTState(
+    # Need to also copy active_ops and step for a complete state copy
 
-        pulls=np.copy(self.pulls),
+    new_state = SMEFTState(pulls=np.copy(self.pulls), chi2=self.chi2, obs_names=self.obs_names)
 
-        chi2=self.chi2,
+    new_state.active_ops = list(self.active_ops) if hasattr(self, 'active_ops') else []
 
-        obs_names=self.obs_names,
-
-    )
-
-    new_state.active_ops = list(getattr(self, "active_ops", []))
-
-    new_state.wc_values = copy.deepcopy(getattr(self, "wc_values", {}))
-
-    new_state.step = int(getattr(self, "step", 0))
+    new_state.step = self.step if hasattr(self, 'step') else 0
 
     return new_state
 
 SMEFTState.copy = _smeftstate_copy
 
-
-
 def _smeftstate_to_dict(self):
 
     return {
 
-        "pulls": np.asarray(self.pulls).tolist(),
+        "pulls": self.pulls.tolist(),
 
-        "chi2": float(self.chi2),
+        "chi2": self.chi2,
 
         "obs_names": self.obs_names,
 
-        "active_ops": list(getattr(self, "active_ops", [])),
+        "active_ops": getattr(self, 'active_ops', []),
 
-        "wc_values": {
-
-            k: float(v) for k, v in getattr(self, "wc_values", {}).items()
-
-        },
-
-        "step": int(getattr(self, "step", 0)),
+        "step": getattr(self, 'step', 0),
 
     }
 
 SMEFTState.to_dict = _smeftstate_to_dict
 
+
 SEED = 42
-
 print(f"Using seed = {SEED}")
-
 random.seed(SEED)
-
 np.random.seed(SEED)
 
 torch.cuda.manual_seed_all(SEED)
-
 n_ops = len(operator_vocab)
-
-n_obs = len(OBS_NAMES)
-
+n_obs = len(constraints_ewp)
 M_ij = np.zeros(
-
     (n_ops,n_obs),
-
     dtype=np.float32
-
 )
 
 print("M_ij shape =", M_ij.shape)
-
 print("operator_vocab =", len(operator_vocab))
-
-print("flat-direction observables =", len(OBS_NAMES))
-
-
+print("constraints =", len(constraints_ewp))
 
 # ============================================================
 
 # SMEFT ACTOR-CRITIC
-
 #
-
 # IMPORTANT STATE DEFINITION
-
-
-
 # ============================================================
-
 #
-
 # The Markov state is explicitly
-
 #
-
 #   s_t = (
-
 #       pulls_t,
-
 #       chi2_t,
-
 #       active_operator_mask_t,
-
 #       fired_operator_mask_t,
-
 #       step_t
-
 #   )
-
 #
 
 # BOTH actor and critic receive this SAME state.
-
 #
-
 # Actor:
-
 #
-
 #   pi_theta(a | s_t)
-
 #
-
 # Critic:
-
 #
-
 #   V_phi(s_t)
-
 #
-
 # The sampled return-to-go
-
 #
-
 #   G_t = r_t + gamma r_{t+1} + ...
-
 #
-
 # is used as the Monte-Carlo estimate of
-
 #
-
 #   Q^pi(s_t, a_t)
-
 #
-
 # and
-
 #
-
 #   A_t = G_t - V_phi(s_t)
-
 #
-
-
-
 # ============================================================
+
 
 import os
-
 import json
-
 import random
-
 import numpy as np
-
 import scipy.stats
-
 import torch
-
 import torch.nn as nn
-
 import torch.nn.functional as F
-
-
-
 # ============================================================
-
 # DEVICE
-
-
-
 # ============================================================
-
 DEVICE = torch.device(
-
     "cuda" if torch.cuda.is_available() else "cpu"
-
 )
-
 
 
 # ============================================================
 
 # MODEL
-
-
-
 # ============================================================
-
-
-
 class SMEFTActorCritic(nn.Module):
-
     """
-
     Actor-Critic model with an explicitly shared state definition.
-
     STATE:
 
         s_t = (
@@ -906,135 +235,77 @@ class SMEFTActorCritic(nn.Module):
     """
 
     def __init__(
-
         self,
-
         op_vocab,
-
         obs_names,
-
         sensitivity_matrix,
-
         chi2_reference,
-
         max_steps=10,
-
         embed_dim=32,
-
         n_heads=4,
-
         alpha_init=1.0,
-
         pull_gain=2.5,
-
     ):
 
         super().__init__()
-
         self.op_vocab = op_vocab
-
         self.obs_names = obs_names
-
         self.num_ops = len(op_vocab)
-
         self.num_obs = len(obs_names)
-
         self.embed_dim = embed_dim
-
         self.max_steps = max_steps
-
         # ----------------------------------------------------
-
         # Operator -> integer index
-
         # ----------------------------------------------------
-
         self.op_to_idx = {
-
             op: i
-
             for i, op in enumerate(op_vocab)
-
         }
 
         # ----------------------------------------------------
-
         # Sensitivity matrix
-
         # ----------------------------------------------------
-
         sm_shape = tuple(
-
             sensitivity_matrix.shape
-
         )
 
         expected = (
-
             self.num_obs,
-
             self.num_ops
-
         )
 
         expected_T = (
-
             self.num_ops,
-
             self.num_obs
-
         )
 
         if sm_shape == expected:
-
             M = sensitivity_matrix.T
-
         elif sm_shape == expected_T:
-
             M = sensitivity_matrix
-
         else:
-
             raise ValueError(
-
                 f"sensitivity_matrix shape {sm_shape} does not match "
-
                 f"(num_obs, num_ops)={expected} or "
-
                 f"(num_ops, num_obs)={expected_T}"
-
             )
 
         self.register_buffer(
-
             "M",
-
             torch.as_tensor(
-
                 M,
-
                 dtype=torch.float32
-
             )
-
         )
 
         # ----------------------------------------------------
-
         # Reference chi2
-
         #
-
         # We normalize chi2 so the network does not receive
-
         # a potentially large raw number.
-
         # ----------------------------------------------------
-
         self.chi2_reference = float(
-
             max(abs(chi2_reference), 1.0) #FIXME
-
         )
 
         # ====================================================
@@ -1393,13 +664,11 @@ class SMEFTActorCritic(nn.Module):
 
         )
 
-        # q = min chi2 at fixed ||C|| can span many orders of magnitude.
+        chi2_normalized = (
 
-        # Feed a bounded log-scale feature to the network.
+            chi2 / self.chi2_reference
 
-        chi2_log10 = np.log10(max(chi2, FLAT_REWARD_EPS))
-
-        chi2_normalized = float(np.clip(chi2_log10 / 12.0, -1.0, 1.0))
+        )
 
         # ----------------------------------------------------
 
@@ -1854,23 +1123,14 @@ class SMEFTActorCritic(nn.Module):
         )
 
         # Defensive check: operator_state contains 5 * embed_dim features,
-
         # and global_repr contributes another embed_dim.
-
         expected_critic_dim = self.embed_dim * 6
-
         if critic_input.shape[-1] != expected_critic_dim:
-
             raise RuntimeError(
-
                 f"Critic input dimension mismatch: got "
-
                 f"{critic_input.shape[-1]}, expected {expected_critic_dim}. "
-
                 f"pooled_operator_state={tuple(pooled_operator_state.shape)}, "
-
                 f"global_repr={tuple(global_repr.shape)}"
-
             )
 
         state_value = self.critic_head(
@@ -1928,140 +1188,312 @@ class SMEFTActorCritic(nn.Module):
         )
 
 
-
 # ============================================================
 
 # STEP-LEVEL REWARD
 
-
-
 # ============================================================
-
-
 
 def compute_step_rewards(
 
     history,
 
-    sparsity_penalty=SPARSITY_PENALTY,
+    alpha_step=0.1,
 
-    rejected_penalty=REJECTED_STEP_PENALTY,
+    dead_step_penalty=0.5,
 
-    eps=FLAT_REWARD_EPS,
+    min_delta_chi2=1e-3,
+
+    solved_bonus=10.0,
+
+    chi2_threshold=1e-6,
 
 ):
 
-    """Reward accepted flatness improvements; penalize rejected proposals."""
+    """
+
+    One reward for every action.
+
+    delta_chi2 =
+
+        trial_chi2 - old_chi2
+
+    Hence
+
+        chi2_drop = -delta_chi2
+
+    is positive when the action improves the fit.
+
+    """
 
     rewards = []
 
-    for item in history:
+    for step in history:
 
-        if not bool(item.get("accepted", True)):
+        delta = float(
 
-            rewards.append(float(-rejected_penalty))
+            step["delta_chi2"]
 
-            continue
+        )
 
-        new_chi2 = max(float(item["trial_sm_chi2"]), 0.0)
+        chi2_drop = -delta
 
-        old_chi2 = item.get("old_sm_chi2")
+        reward = (
 
-        if old_chi2 is None:
+            chi2_drop
 
-            reward = -np.log10(new_chi2 + eps) - sparsity_penalty
+            - alpha_step
 
-        else:
+        )
 
-            old_chi2 = max(float(old_chi2), 0.0)
+        if chi2_drop < min_delta_chi2:
 
-            reward = (
+            reward -= dead_step_penalty
 
-                np.log10(old_chi2 + eps)
+        if (
 
-                - np.log10(new_chi2 + eps)
+            step["trial_chi2"]
 
-                - sparsity_penalty
+            < chi2_threshold
 
-            )
+        ):
 
-        rewards.append(float(reward))
+            reward += solved_bonus
+
+        rewards.append(
+
+            float(reward)
+
+        )
 
     return rewards
-
 
 
 # ============================================================
 
 # RETURN-TO-GO
 
-
-
 # ============================================================
 
+def compute_returns_to_go(
 
+    step_rewards,
 
-def compute_returns_to_go(step_rewards, gamma=0.99):
+    gamma=0.99,
 
-    returns = [0.0 for _ in step_rewards]
+):
+
+    """
+
+    G_t = r_t + gamma r_{t+1}
+
+              + gamma^2 r_{t+2} + ...
+
+    This is the Monte-Carlo estimate used as:
+
+        G_t ~ Q^pi(s_t, a_t)
+
+    """
+
+    returns = [
+
+        0.0
+
+        for _ in step_rewards
+
+    ]
 
     running = 0.0
 
-    for t in reversed(range(len(step_rewards))):
+    for t in reversed(
 
-        running = step_rewards[t] + gamma * running
+        range(len(step_rewards))
+
+    ):
+
+        running = (
+
+            step_rewards[t]
+
+            + gamma * running
+
+        )
 
         returns[t] = running
 
     return returns
 
 
-
 # ============================================================
 
 # TRAJECTORY REWARD
 
-
-
 # ============================================================
-
-
 
 def compute_rollout_reward(
 
     final_state,
 
+    baseline_chi2,
+
     trajectory_length=None,
 
-    sparsity_penalty=SPARSITY_PENALTY,
+    history=None,
 
-    eps=FLAT_REWARD_EPS,
+    alpha_step=0.1,
 
-    **_ignored,
+    dead_step_penalty=0.5,
+
+    min_delta_chi2=1e-3,
+
+    solved_bonus=10.0,
+
+    chi2_threshold=1e-6,
+
+    clip_reward=False,
+
+    clip_range=(-20.0, 20.0),
 
 ):
 
-    """Logging/best-trajectory score: -log10(q_final) - lambda*N_ops."""
+    """
 
-    final_chi2 = max(float(final_state.chi2), 0.0)
+    Logging / best-trajectory reward.
 
-    n_ops = int(trajectory_length or 0)
+    NOT used for policy gradient.
 
-    reward = -np.log10(final_chi2 + eps) - sparsity_penalty * n_ops
+    """
 
-    return float(reward), float(final_chi2)
+    if isinstance(
 
+        final_state,
+
+        dict
+
+    ):
+
+        if "chi2_total" in final_state:
+
+            final_chi2 = final_state[
+
+                "chi2_total"
+
+            ]
+
+        else:
+
+            final_chi2 = final_state[
+
+                "chi2"
+
+            ]
+
+    elif hasattr(
+
+        final_state,
+
+        "chi2"
+
+    ):
+
+        final_chi2 = final_state.chi2
+
+    else:
+
+        raise ValueError(
+
+            "final_state does not contain chi2"
+
+        )
+
+    delta_chi2 = (
+
+        baseline_chi2
+
+        - final_chi2
+
+    )
+
+    reward = delta_chi2
+
+    if (
+
+        abs(delta_chi2)
+
+        <= min_delta_chi2
+
+    ):
+
+        reward -= 30.0
+
+    if final_chi2 < chi2_threshold:
+
+        reward += solved_bonus
+
+    if trajectory_length is not None:
+
+        reward -= (
+
+            alpha_step
+
+            * trajectory_length
+
+        )
+
+    if history is not None:
+
+        for item in history:
+
+            delta = float(
+
+                item.get(
+
+                    "delta_chi2",
+
+                    0.0
+
+                )
+
+            )
+
+            chi2_drop = -delta
+
+            if (
+
+                chi2_drop
+
+                < min_delta_chi2
+
+            ):
+
+                reward -= dead_step_penalty
+
+    if clip_reward:
+
+        reward = np.clip(
+
+            reward,
+
+            clip_range[0],
+
+            clip_range[1]
+
+        )
+
+    return (
+
+        float(reward),
+
+        float(delta_chi2)
+
+    )
 
 
 # ============================================================
 
 # RUNNING RETURN NORMALIZER
 
-
-
 # ============================================================
-
-
 
 class RunningReturnNormalizer:
 
@@ -2220,160 +1652,240 @@ class RunningReturnNormalizer:
         )
 
 
-
 # ============================================================
 
 # ROLLOUT
 
-
-
 # ============================================================
 
-
-
 def rollout(
-
     policy,
-
     pull_fn,
-
     obs_names,
-
     baseline_pulls,
-
     baseline_chi2,
-
     max_steps=10,
-
     deterministic=False,
-
     verbose=True,
-
     trajectory_idx=1,
-
     total_trajectories=30,
-
 ):
 
-    # Every proposal is evaluated once. The first operator establishes the
-    # one-operator reference. Later operators are accepted only when they
-    # improve fixed-norm SM-like chi2 by MIN_LOG10_CHI2_IMPROVEMENT.
-
+    device = policy.M.device
+    # --------------------------------------------------------
+    # INITIAL STATE
+    # --------------------------------------------------------
     current_state = SMEFTState(
-
-        pulls=np.asarray(baseline_pulls, dtype=np.float32),
-
-        chi2=float(baseline_chi2),
-
+        pulls=np.array(
+            baseline_pulls,
+            dtype=np.float32
+        ),
+        chi2=float(
+            baseline_chi2
+        ),
         obs_names=obs_names,
-
     )
-
     current_state.active_ops = []
-
-    current_state.wc_values = {}
-
     current_state.step = 0
 
+    # --------------------------------------------------------
+    # Operators that have already been evaluated
+    # --------------------------------------------------------
     all_evaluated_op_indices = set()
-
     accepted_op_indices = []
-
+    # --------------------------------------------------------
+    # Training quantities
+    # --------------------------------------------------------
     log_probs = []
-
     entropies = []
-
     attentions = []
-
     diagnostics = []
-
+    # V(s_t)
     state_values = []
-
-    state_trajectory = [current_state.copy()]
+    state_trajectory = [
+        current_state.copy()
+    ]
 
     history = []
-
     if verbose:
-
         print(
-
-            f"\n--- Trajectory [{trajectory_idx:02d} / "
-
+            f"\n--- Trajectory "
+            f"[{trajectory_idx:02d} / "
             f"{total_trajectories:02d}] ---"
-
         )
 
-    for step_idx in range(max_steps):
+    # ========================================================
+    # TRAJECTORY
+    # ========================================================
+    for step_idx in range(
+        max_steps
+    ):
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # The policy receives the COMPLETE state:
+        #
+        # pulls
+        # chi2
+        # active_ops
+        # fired_ops
+        # step
+        #
+        # ----------------------------------------------------
 
-        state_before = current_state.copy()
-
-        logits, state_val, attn_weights, diag = policy(
-
+        (
+            logits,
+            state_val,
+            attn_weights,
+            diag,
+        ) = policy(
             current_state,
+            fired_ops=all_evaluated_op_indices
+        )
 
-            fired_ops=all_evaluated_op_indices,
+        # ----------------------------------------------------
+        # Policy distribution
+        # ----------------------------------------------------
+        dist = torch.distributions.Categorical(
+            logits=logits
+        )
+        if deterministic:
+            action = torch.argmax(
+                logits
+            )
+        else:
+            action = dist.sample()
+        action_idx = int(
+            action.item()
+        )
+
+        # ----------------------------------------------------
+        # Store action information
+        # ----------------------------------------------------
+        log_probs.append(
+            dist.log_prob(action)
+        )
+        entropies.append(
+            dist.entropy()
+        )
+        attentions.append(
+            attn_weights.detach()
+        )
+        diagnostics.append(
+            diag
+        )
+
+        # IMPORTANT:
+        #
+        # This is V(s_t), i.e. the value BEFORE taking
+        # action a_t.
+        #
+        state_values.append(
+            state_val
+        )
+
+        # ----------------------------------------------------
+        # Mark action as evaluated
+        # ----------------------------------------------------
+        all_evaluated_op_indices.add(
+            action_idx
+        )
+        proposed_op = (
+            policy.op_vocab[
+                action_idx
+            ]
+        )
+        # ----------------------------------------------------
+        # Environment transition
+        #
+        # The active operators define the current SMEFT
+        # theory.
+        # ----------------------------------------------------
+
+        trial_ops = (
+            list(
+                current_state.active_ops
+            )
+            + [proposed_op]
+        )
+        (
+            _,
+
+            trial_pulls,
+
+            trial_chi2,
+
+            _,
+
+            _
+
+        ) = pull_fn(
+
+            trial_ops
 
         )
 
-        dist = torch.distributions.Categorical(logits=logits)
+        trial_chi2 = float(
 
-        action = torch.argmax(logits) if deterministic else dist.sample()
+            trial_chi2
 
-        action_idx = int(action.item())
+        )
 
-        log_probs.append(dist.log_prob(action))
+        old_chi2 = float(
 
-        entropies.append(dist.entropy())
+            current_state.chi2
 
-        attentions.append(attn_weights.detach())
+        )
 
-        diagnostics.append(diag)
+        chi2_reduction = (
 
-        state_values.append(state_val)
+            old_chi2
 
-        all_evaluated_op_indices.add(action_idx)
+            - trial_chi2
 
-        proposed_op = policy.op_vocab[action_idx]
+        )
 
-        trial_ops = list(current_state.active_ops) + [proposed_op]
+        delta_raw = (
 
-        old_sm_chi2 = None if len(current_state.active_ops) == 0 else float(current_state.chi2)
+            trial_chi2
 
-        _, trial_pulls, trial_chi2, trial_predictions, trial_wc = pull_fn(trial_ops)
+            - old_chi2
 
-        trial_chi2 = float(trial_chi2)
+        )
 
-        if old_sm_chi2 is None:
+        # ----------------------------------------------------
 
-            log_improvement = None
+        # Accept/reject
+
+        # ----------------------------------------------------
+
+        accepted = False
+
+        if (
+
+            chi2_reduction
+
+            > deltachi2_min
+
+        ):
 
             accepted = True
 
-        else:
+            accepted_op_indices.append(
 
-            log_improvement = float(
-
-                np.log10(max(old_sm_chi2, 0.0) + FLAT_REWARD_EPS)
-
-                - np.log10(max(trial_chi2, 0.0) + FLAT_REWARD_EPS)
+                action_idx
 
             )
-
-            accepted = bool(
-
-                np.isfinite(log_improvement)
-
-                and log_improvement >= MIN_LOG10_CHI2_IMPROVEMENT
-
-            )
-
-        if accepted:
-
-            accepted_op_indices.append(action_idx)
 
             current_state = SMEFTState(
 
-                pulls=np.asarray(trial_pulls, dtype=np.float32),
+                pulls=np.array(
+
+                    trial_pulls,
+
+                    dtype=np.float32
+
+                ),
 
                 chi2=trial_chi2,
 
@@ -2381,123 +1893,247 @@ def rollout(
 
             )
 
-            current_state.active_ops = list(trial_ops)
+            current_state.active_ops = (
 
-            current_state.wc_values = dict(trial_wc)
-
-            current_state.step = step_idx + 1
-
-        else:
-
-            current_state = state_before.copy()
-
-            current_state.step = step_idx + 1
-
-        state_trajectory.append(current_state.copy())
-
-        if verbose:
-
-            improvement_text = "first-op" if log_improvement is None else f"dlog10chi2={log_improvement:+8.4f}"
-
-            status_text = "ACCEPT" if accepted else "REJECT"
-
-            print(
-
-                f"STEP {step_idx:02d}: {status_text:6s} {proposed_op:20s} "
-
-                f"trial_chi2={trial_chi2:12.6g} "
-
-                f"{improvement_text} "
-
-                f"WC={{{', '.join(f'{k}:{v:+.3g}' for k, v in trial_wc.items())}}}"
+                list(trial_ops)
 
             )
 
+            current_state.step = (
+
+                step_idx + 1
+
+            )
+
+        else:
+
+            # Rejected operator does not change
+
+            # physics state, but DOES change:
+
+            #
+
+            #   fired mask
+
+            #   step
+
+            #
+
+            current_state.step = (
+
+                step_idx + 1
+
+            )
+
+        state_trajectory.append(
+
+            current_state.copy()
+
+        )
+
+        # ----------------------------------------------------
+
+        # Print
+
+        # ----------------------------------------------------
+
+        if verbose:
+
+            status = (
+
+                "ACCEPT"
+
+                if accepted
+
+                else "REJECT"
+
+            )
+
+            print(
+
+                f"STEP {step_idx:02d}: "
+
+                f"ADD {proposed_op:20s} "
+
+                f"Deltachi^2={delta_raw:+8.3f} "
+
+                f"(Drop: "
+
+                f"{chi2_reduction:8.3f}) "
+
+                f"{status}"
+
+            )
+
+        # ----------------------------------------------------
+
+        # History
+
+        # ----------------------------------------------------
+
         history.append({
 
-            "step": step_idx,
+            "step":
 
-            "proposed_operator": proposed_op,
+                step_idx,
 
-            "accepted": bool(accepted),
+            "proposed_operator":
 
-            "acceptance_threshold_log10": float(MIN_LOG10_CHI2_IMPROVEMENT),
+                proposed_op,
 
-            "state_before": state_before.to_dict(),
+            "accepted":
 
-            "state_after": current_state.to_dict(),
+                accepted,
 
-            "old_sm_chi2": old_sm_chi2,
+            "state_before":
 
-            "trial_sm_chi2": trial_chi2,
+                state_trajectory[-2].to_dict(),
 
-            "log10_chi2_improvement": log_improvement,
+            "state_after":
 
-            "trial_wc": {k: float(v) for k, v in trial_wc.items()},
+                current_state.to_dict(),
 
-            "trial_wc_norm_sq": float(sum(float(v) ** 2 for v in trial_wc.values())),
+            "trial_chi2":
 
-            "trial_predictions": [float(x) for x in trial_predictions],
+                float(trial_chi2),
+
+            "delta_chi2":
+
+                float(delta_raw),
 
         })
 
+    # ========================================================
+
+    # FINAL
+
+    # ========================================================
+
     if verbose:
 
-        final_ops_str = " -> ".join(current_state.active_ops) if current_state.active_ops else "None"
+        if current_state.active_ops:
 
-        print(f"FINAL ACCEPTED SEQUENCE [{len(current_state.active_ops)} ops]: {final_ops_str}")
+            final_ops_str = (
+
+                " -> ".join(
+
+                    current_state.active_ops
+
+                )
+
+            )
+
+        else:
+
+            final_ops_str = (
+
+                "None (Pure SM)"
+
+            )
+
+        total_delta_chi2 = (
+
+            float(baseline_chi2)
+
+            - current_state.chi2
+
+        )
 
         print(
 
-            f"FINAL RESULTS: min chi2 at ||C||={FIXED_WC_NORM:g} = "
+            f"FINAL SEQUENCE "
 
-            f"{current_state.chi2:.8g} | WC = {current_state.wc_values}"
+            f"[{len(current_state.active_ops)} ops]: "
+
+            f"{final_ops_str}"
+
+        )
+
+        print(
+
+            f"FINAL RESULTS: "
+
+            f"Total Deltachi^2 = "
+
+            f"{total_delta_chi2:+.3f} | "
+
+            f"Final chi^2 = "
+
+            f"{current_state.chi2:.3f}"
 
         )
 
     return {
 
-        "final_state": current_state,
+        "final_state":
 
-        "state_trajectory": state_trajectory,
+            current_state,
 
-        "ops": accepted_op_indices,
+        "state_trajectory":
 
-        "evaluated_ops": sorted(all_evaluated_op_indices),
+            state_trajectory,
 
-        "op_names": current_state.active_ops,
+        "ops":
 
-        "log_probs": torch.stack(log_probs),
+            accepted_op_indices,
 
-        "entropies": torch.stack(entropies),
+        "op_names":
 
-        "state_values": torch.stack(state_values),
+            current_state.active_ops,
 
-        "attention": attentions,
+        "log_probs":
 
-        "diagnostics": diagnostics,
+            torch.stack(
 
-        "history": history,
+                log_probs
+
+            ),
+
+        "entropies":
+
+            torch.stack(
+
+                entropies
+
+            ),
+
+        "state_values":
+
+            torch.stack(
+
+                state_values
+
+            ),
+
+        "attention":
+
+            attentions,
+
+        "diagnostics":
+
+            diagnostics,
+
+        "history":
+
+            history,
 
     }
-
 
 
 # ============================================================
 
 # TRAINING PARAMETERS
 
-
-
 # ============================================================
 
-MAX_STEPS = 3  # start small for validation; increase after SVD checks
+MAX_STEPS = 10
 
 ROLLOUTS_PER_BATCH = 25
 
 N_BATCHES = 300
 
-# First operator is accepted; later operators must pass the minimum log-chi2 improvement threshold.
+deltachi2_min = 2 
+#1e-2 #is original value used in the paper  
 
 GRAD_CLIP = 0.5
 
@@ -2510,12 +2146,9 @@ ADV_NORMALIZE = True
 RETURN_NORM_MOMENTUM = 0.01
 
 
-
 # ============================================================
 
 # MODEL INITIALIZATION
-
-
 
 # ============================================================
 
@@ -2543,6 +2176,7 @@ M_normalized = (
 
 ) / M_std
 
+
 model = SMEFTActorCritic(
 
     op_vocab=operator_vocab,
@@ -2555,7 +2189,7 @@ model = SMEFTActorCritic(
 
     chi2_reference=
 
-        1.0,
+        CHI2_SM,
 
     max_steps=
 
@@ -2571,6 +2205,7 @@ model = SMEFTActorCritic(
 
 ).to(DEVICE)
 
+
 optimizer = torch.optim.AdamW(
 
     model.parameters(),
@@ -2580,6 +2215,7 @@ optimizer = torch.optim.AdamW(
     weight_decay=1e-4,
 
 )
+
 
 return_normalizer = (
 
@@ -2594,18 +2230,15 @@ return_normalizer = (
 )
 
 
-
 # ============================================================
 
 # OUTPUT
-
-
 
 # ============================================================
 
 OUTPUT_DIR = (
 
-    "/home/kumarj/links/scratch/blind/"
+    "/home/kumarj/links/scratch/tmp_real/"
 
 )
 
@@ -2618,52 +2251,24 @@ os.makedirs(
 )
 
 METRICS_LOG_PATH = os.path.join(
-
     OUTPUT_DIR,
-
     "metrics_log.txt"
-
 )
 
 THEORY_ARCHIVE_PATH = os.path.join(
-
     OUTPUT_DIR,
-
     "theory_archive.json"
-
 )
 
 REWARD_DISTS_PATH = os.path.join(
-
     OUTPUT_DIR,
-
     "reward_distributions.json"
-
 )
-
-TOP_COMBINATIONS_PATH = os.path.join(
-
-    OUTPUT_DIR,
-
-    "top_100_operator_combinations.txt"
-
-)
-
-TOP_COMBINATIONS_JSON_PATH = os.path.join(
-
-    OUTPUT_DIR,
-
-    "top_100_operator_combinations.json"
-
-)
-
 
 
 # ============================================================
 
 # METRICS
-
-
 
 # ============================================================
 
@@ -2683,7 +2288,7 @@ with open(
 
         "max_traj_reward\t"
 
-        "mean_flat_chi2\t"
+        "mean_delta_chi2\t"
 
         "actor_loss\t"
 
@@ -2717,6 +2322,7 @@ with open(
 
     )
 
+
 if not os.path.exists(
 
     THEORY_ARCHIVE_PATH
@@ -2740,6 +2346,7 @@ if not os.path.exists(
             indent=2
 
         )
+
 
 if not os.path.exists(
 
@@ -2765,618 +2372,231 @@ if not os.path.exists(
 
         )
 
+
 theory_archive = []
-
 reward_distributions = {}
-
 best_reward = -float("inf")
-
 best_ops = None
 
-
-
-# Best occurrence of each UNIQUE operator combination.
-
-# The key is sorted, so different selection orders count as the same combination.
-
-best_combinations = {}
-
-TOP_N_COMBINATIONS = 100
-
-
-
-def update_best_combination(
-
-    operator_names,
-
-    traj_reward,
-
-    flat_chi2,
-
-    wc_values,
-
-    batch_idx,
-
-    rollout_idx,
-
-):
-
-    key = tuple(sorted(operator_names))
-
-    if not key:
-
-        return
-
-
-
-    record = {
-
-        "operators": list(key),
-
-        "n_operators": len(key),
-
-        "traj_reward": float(traj_reward),
-
-        "sm_like_chi2": float(flat_chi2),
-
-        "fixed_norm": float(FIXED_WC_NORM),
-
-        "wc_values": {k: float(v) for k, v in wc_values.items()},
-
-        "batch": int(batch_idx),
-
-        "rollout": int(rollout_idx),
-
-    }
-
-
-
-    previous = best_combinations.get(key)
-
-    if previous is None or record["traj_reward"] > previous["traj_reward"]:
-
-        best_combinations[key] = record
-
-
-
-
-
-def get_top_combinations(n=TOP_N_COMBINATIONS):
-
-    records = list(best_combinations.values())
-
-    records.sort(
-
-        key=lambda r: (
-
-            -r["traj_reward"],
-
-            r["sm_like_chi2"],
-
-            r["n_operators"],
-
-            tuple(r["operators"]),
-
-        )
-
-    )
-
-    return records[:n]
-
-
-
-
-
-def write_top_combinations():
-
-    top_records = get_top_combinations()
-
-
-
-    with open(TOP_COMBINATIONS_JSON_PATH, "w") as f:
-
-        json.dump(top_records, f, indent=2)
-
-
-
-    with open(TOP_COMBINATIONS_PATH, "w") as f:
-
-        f.write(
-
-            "rank\ttraj_reward\tsm_like_chi2\tn_operators\t"
-
-            "operators\twc_values\tbatch\trollout\n"
-
-        )
-
-        for rank, record in enumerate(top_records, start=1):
-
-            operators_str = ", ".join(record["operators"])
-
-            wc_str = ", ".join(
-
-                f"{op}={record['wc_values'].get(op, 0.0):+.8g}"
-
-                for op in record["operators"]
-
-            )
-
-            f.write(
-
-                f"{rank}\t"
-
-                f"{record['traj_reward']:.10g}\t"
-
-                f"{record['sm_like_chi2']:.10g}\t"
-
-                f"{record['n_operators']}\t"
-
-                f"{operators_str}\t"
-
-                f"{wc_str}\t"
-
-                f"{record['batch']}\t"
-
-                f"{record['rollout']}\n"
-
-            )
-
-
-
 # ============================================================
-
 # TRAINING LOOP
-
-
-
 # ============================================================
-
 for batch_idx in range(N_BATCHES):
-
     model.train()
-
     progress = (batch_idx / float(N_BATCHES))
-
     entropy_coef = (0.01 * (1.0 - progress) + 0.0001 * progress)
-
     batch_traj_rewards = []
-
-    batch_flat_chi2 = []
-
+    batch_delta_chi2 = []
     batch_ops = []
-
     # --------------------------------------------------------
-
     # Step-level quantities
-
     # --------------------------------------------------------
-
     all_log_probs = []
-
     all_entropies = []
-
     all_state_values = []
-
     all_returns = []
-
     # --------------------------------------------------------
-
     # Diagnostics
-
     # --------------------------------------------------------
-
     batch_attn_correlations = []
-
     batch_base_norms = []
-
     batch_direct_norms = []
-
     print(f"\n==================== "
-
           f"BATCH {batch_idx:03d} "
-
           f"====================")
-
     # ========================================================
-
     # ROLLOUTS
-
     # ========================================================
-
     for rollout_idx in range(
-
         ROLLOUTS_PER_BATCH
-
     ):
-
         result = rollout(
-
             policy=model,
-
-            pull_fn=flat_direction_fn,
-
+            pull_fn=flavio_pull_fn,
             obs_names=OBS_NAMES,
-
             baseline_pulls=
-
-                FLAT_BASELINE_PULLS,
-
+                BASELINE_PULLS,
             baseline_chi2=
-
-                0.0,
-
+                CHI2_SM,
             max_steps=
-
                 MAX_STEPS,
-
             deterministic=False,
-
             verbose=True,
-
             trajectory_idx=
-
                 rollout_idx + 1,
-
             total_trajectories=
-
                 ROLLOUTS_PER_BATCH,
-
         )
 
         final_state = result["final_state"]
-
         hist = result["history"]
-
         traj_ops = result["ops"]
-
         traj_len = len(traj_ops)
 
         # ====================================================
-
         # TRAJECTORY REWARD
-
         # ====================================================
-
-        (traj_reward,final_flat_chi2) = compute_rollout_reward(
-
+        (traj_reward,delta_chi2) = compute_rollout_reward(
             final_state=final_state,
-
-            trajectory_length=traj_len,
-
-            sparsity_penalty=SPARSITY_PENALTY,
-
-        )
-
-        # ====================================================
-
-        # STEP REWARDS
-
-        # ====================================================
-
-        step_rewards = (
-
-            compute_step_rewards(
-
+            baseline_chi2=
+                CHI2_SM,
+            trajectory_length=
+                traj_len,
+            history=
                 hist,
-
-                sparsity_penalty=SPARSITY_PENALTY,
-
-                ))
+            alpha_step=0.1,
+            dead_step_penalty=0.5,)
 
         # ====================================================
+        # STEP REWARDS
+        # ====================================================
+        step_rewards = (
+            compute_step_rewards(
+                hist,
+                alpha_step=0.1,
+                dead_step_penalty=0.5,))
 
+        # ====================================================
         # RETURN-TO-GO
-
         # ====================================================
-
         returns_to_go = (
-
             compute_returns_to_go(
-
                 step_rewards,
-
                 gamma=GAMMA))
-
         returns_t = torch.tensor(
-
             returns_to_go,
-
             dtype=torch.float32,
-
             device=DEVICE)
 
         # ====================================================
-
         # STORE ACTOR / CRITIC DATA
-
         # ====================================================
-
         all_log_probs.append(result["log_probs"])
-
         all_entropies.append(result["entropies"])
-
         all_state_values.append(result["state_values"])
-
         all_returns.append(returns_t)
 
         # ====================================================
-
         # ARCHIVE
-
         # ====================================================
-
         """
-
         theory_archive.append({"batch":
-
                 batch_idx,
-
             "rollout": rollout_idx,
-
             "traj_reward": float(traj_reward),
-
             "step_rewards": [float(r) for r in step_rewards],
-
             "returns_to_go":[float(r) for r in returns_to_go],
-
-            "fixed_norm": float(FIXED_WC_NORM),
-
-            "sm_like_chi2": float(final_state.chi2),
-
-            "wc_values": {k: float(v) for k, v in getattr(final_state, "wc_values", {}).items()},
-
+            "delta_chi2": float(delta_chi2),
+            "chi2_min": float(final_state.chi2),
             "operators": result["op_names"],
-
             "pulls": np.asarray(final_state.pulls).tolist(),
-
             "history":hist,})
 
         with open(THEORY_ARCHIVE_PATH, "w") as f:
-
             json.dump(theory_archive, f, indent=2)
-
         """
-
         # ====================================================
-
         # BATCH LOGGING
-
         # ====================================================
-
         batch_traj_rewards.append(float(traj_reward))
-
-        batch_flat_chi2.append(float(final_flat_chi2))
-
+        batch_delta_chi2.append(float(delta_chi2))
         batch_ops.append(traj_ops)
-
-        theory_archive.append({
-
-            "batch": batch_idx,
-
-            "rollout": rollout_idx,
-
-            "traj_reward": float(traj_reward),
-
-            "step_rewards": [float(r) for r in step_rewards],
-
-            "returns_to_go": [float(r) for r in returns_to_go],
-
-            "fixed_norm": float(FIXED_WC_NORM),
-
-            "sm_like_chi2": float(final_state.chi2),
-
-            "wc_values": {
-
-                k: float(v) for k, v in getattr(final_state, "wc_values", {}).items()
-
-            },
-
-            "operators": result["op_names"],
-
-            "pulls": np.asarray(final_state.pulls).tolist(),
-
-            "history": hist,
-
-        })
-
-        update_best_combination(
-
-            operator_names=result["op_names"],
-
-            traj_reward=traj_reward,
-
-            flat_chi2=final_state.chi2,
-
-            wc_values=getattr(final_state, "wc_values", {}),
-
-            batch_idx=batch_idx,
-
-            rollout_idx=rollout_idx,
-
-        )
-
         """
-
         # ====================================================
-
         # ATTENTION DIAGNOSTICS
-
         # ====================================================
-
         for (attn_matrix,diag) in zip(result["attention"],result["diagnostics"]):
-
             abs_pulls = np.abs(diag["pulls"])
-
             if np.sum(abs_pulls) > 0:
-
                 step_corrs = []
-
                 attn_np = (attn_matrix.cpu().numpy())
 
                 for op_idx in range(attn_np.shape[0]):
-
                     row_attn = (attn_np[op_idx])
-
                     corr, _ = (scipy.stats.spearmanr(row_attn,abs_pulls))
-
                     if not np.isnan(corr):
-
                         step_corrs.append(corr)
-
                 if step_corrs:
-
                     batch_attn_correlations.append(np.mean(step_corrs))
-
             batch_base_norms.append(torch.norm(diag["base_logits"]).cpu().item())
-
             batch_direct_norms.append(torch.norm(diag["direct_logits"]).cpu().item())
-
         """
-
         # ====================================================
-
         # BEST TRAJECTORY
-
         # ====================================================
-
         if (traj_reward > best_reward):
-
             best_reward = (traj_reward)
-
             best_ops = list(traj_ops)
-
     # ========================================================
-
     # REWARD DISTRIBUTION
-
     # ========================================================
-
     reward_distributions[f"batch_{batch_idx}"] = batch_traj_rewards
-
     # ========================================================
-
     # FLATTEN ALL STEPS
-
     # ========================================================
-
     flat_log_probs = torch.cat(all_log_probs)
-
     flat_entropies = torch.cat(all_entropies)
-
     flat_values = torch.cat(all_state_values)
-
     flat_returns = torch.cat(all_returns)
-
     # ========================================================
-
     # NORMALIZED RETURNS
-
     # ========================================================
-
     flat_returns_norm = (return_normalizer.update_and_normalize(flat_returns))
 
     # ========================================================
-
     # RAW ADVANTAGE
-
     #
-
     # G_t is the Monte-Carlo Q estimate.
-
     #
-
     # V(s_t) is the critic.
-
     #
-
     # Therefore:
-
     #
-
     # A_t = G_t - V(s_t)
-
     #
-
     # ========================================================
-
     raw_advantages = (flat_returns_norm- flat_values.detach())
-
     raw_advantage_mean = (raw_advantages.mean())
-
     raw_advantage_std = (raw_advantages.std())
-
     mean_abs_raw_advantage = (raw_advantages.abs().mean())
-
     max_abs_raw_advantage = (raw_advantages.abs().max())
 
     # ========================================================
-
     # EXPLAINED VARIANCE
-
     # ========================================================
-
     target_var = (flat_returns_norm.detach().var())
 
     if target_var.item() > 1e-8:
-
         explained_variance = (
-
             1.0
-
             - (
-
                 flat_returns_norm.detach()
-
                 - flat_values.detach()
-
             )
-
             .var()
-
             / (
-
                 target_var
-
                 + 1e-8
-
             )
-
         )
-
     else:
-
         explained_variance = torch.tensor(
-
             0.0,
-
             device=DEVICE
-
         )
 
     # ========================================================
-
     # ADVANTAGE NORMALIZATION
-
     # ========================================================
-
     advantages = raw_advantages
-
     if (
-
         ADV_NORMALIZE
-
         and advantages.numel() > 1
-
         and advantages.std().item() > 1e-6
-
     ):
-
         advantages = (
-
             (
-
                 advantages
-
                 - advantages.mean()
 
             )
@@ -3515,11 +2735,11 @@ for batch_idx in range(N_BATCHES):
 
     )
 
-    batch_mean_flat_chi2 = float(
+    batch_mean_delta_chi2 = float(
 
         np.mean(
 
-            batch_flat_chi2
+            batch_delta_chi2
 
         )
 
@@ -3555,7 +2775,7 @@ for batch_idx in range(N_BATCHES):
 
             f"{batch_max_traj_reward:.6f}\t"
 
-            f"{batch_mean_flat_chi2:.6f}\t"
+            f"{batch_mean_delta_chi2:.6f}\t"
 
             f"{actor_loss.item():.6f}\t"
 
@@ -3589,12 +2809,24 @@ for batch_idx in range(N_BATCHES):
 
         )
 
-    # ========================================================
+    # ====================================================
+    # ARCHIVE
+    # ====================================================
+    theory_archive.append({"batch":
+                batch_idx,
+            "rollout": rollout_idx,
+            "traj_reward": float(traj_reward),
+            "step_rewards": [float(r) for r in step_rewards],
+            "returns_to_go":[float(r) for r in returns_to_go],
+            "delta_chi2": float(delta_chi2),
+            "chi2_min": float(final_state.chi2),
+            "operators": result["op_names"],
+            "pulls": np.asarray(final_state.pulls).tolist(),
+            "history":hist,})
 
+    # ========================================================
     # PRINT SUMMARY
-
     # ========================================================
-
     print(
 
         f"\n>>> SUMMARY "
@@ -3617,9 +2849,9 @@ for batch_idx in range(N_BATCHES):
 
         f"{entropy_loss.item():.4f} | "
 
-        f"Mean fixed-norm chi2: "
+        f"Mean Deltachi^2: "
 
-        f"{batch_mean_flat_chi2:.2f}"
+        f"{batch_mean_delta_chi2:.2f}"
 
     )
 
@@ -3655,62 +2887,5 @@ for batch_idx in range(N_BATCHES):
 
     )
 
-
-
-    # Keep the top-100 files current even if a long training run stops early.
-
-    write_top_combinations()
-
-
-
 with open(THEORY_ARCHIVE_PATH, "w") as f:
-
     json.dump(theory_archive, f, indent=2)
-
-
-
-with open(REWARD_DISTS_PATH, "w") as f:
-
-    json.dump(reward_distributions, f, indent=2)
-
-
-
-# Final top-100 write and concise console summary.
-
-write_top_combinations()
-
-top_records = get_top_combinations()
-
-print("\n================ TOP OPERATOR COMBINATIONS ================")
-
-for rank, record in enumerate(top_records, start=1):
-
-
-
-    wc_values = record["wc_values"]
-
-
-
-    ops_with_wc = " + ".join(
-
-        f"{op}({float(wc_values[op]):+.6f})"
-
-        for op in record["operators"]
-
-    )
-
-
-
-    print(
-
-        f"{rank:3d}. reward={record['traj_reward']:.6f} | "
-
-        f"chi2_SM={record['sm_like_chi2']:.6e} | "
-
-        f"ops={ops_with_wc}"
-
-    )
-
-print(f"\nSaved top combinations to: {TOP_COMBINATIONS_PATH}")
-
-print(f"Saved JSON version to: {TOP_COMBINATIONS_JSON_PATH}")
