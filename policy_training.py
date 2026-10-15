@@ -1,3 +1,10 @@
+# An actor-critic RL framework for discrete sequence optimization.
+# Sequence represents the list of effective operators of New Physics
+# theory (SMEFT). The goal is to find theories which explain anomalies
+# in data in the best possible way. 
+
+#(* Main *)
+
 import sys
 from pathlib import Path
 import copy
